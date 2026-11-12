@@ -14,8 +14,8 @@ Seguridad:
   intentos de cerrarlos o falsificarlos (defensa contra Prompt Injection).
 - La salida se fuerza a JSON (con esquema), se valida y se post-procesa:
   `SECURITY` => `requiresHumanReview = True` siempre.
-- Cualquier fallo (API, red, cuota, parseo) devuelve una estructura segura que
-  exige revisión humana, sin exponer secretos.
+- Cualquier fallo de configuración o del proveedor lanza excepciones controladas
+  sin exponer API keys ni trazas sensibles.
 """
 
 from __future__ import annotations
@@ -83,28 +83,27 @@ RESPONSE_SCHEMA: dict[str, Any] = {
 }
 
 
-def _safe_fallback(reason: str = "") -> dict[str, Any]:
-    """Estructura segura ante errores: siempre exige revisión humana."""
-    if reason:
-        print(f"[generative] Fallback activado: {reason}", file=sys.stderr)
-    return {
-        "category": "BUG",
-        "priority": "MEDIUM",
-        "response": (
-            "Hemos recibido tu solicitud. Por el momento no pudimos procesarla "
-            "automáticamente, así que un miembro de nuestro equipo la revisará "
-            "y te responderá a la brevedad."
-        ),
-        "requiresHumanReview": True,
-    }
+class GenerativeEngineError(RuntimeError):
+    """Error base controlado del motor generativo."""
+
+
+class GenerativeConfigError(GenerativeEngineError):
+    """Error de configuración o dependencias faltantes (ej. API key ausente)."""
+
+
+class GenerativeProviderError(GenerativeEngineError):
+    """Error de red, cuota, timeout o formato inválido del proveedor LLM."""
 
 
 def _sanitize_ticket(message: str) -> str:
     """Limita el largo y neutraliza intentos de cerrar/falsificar los delimitadores."""
     text = message.strip()[:MAX_MESSAGE_CHARS]
-    # Elimina cualquier secuencia tipo "--- INICIO/FIN DEL TICKET ---" (insensible a mayúsculas/espacios).
-    text = re.sub(r"-{2,}\s*(INICIO|FIN)\s+DEL\s+TICKET\s*-{2,}", "[delimitador eliminado]", text, flags=re.I)
-    # Quita caracteres de control (salvo saltos de línea y tabulaciones).
+    text = re.sub(
+        r"-{2,}\s*(INICIO|FIN)\s+DEL\s+TICKET\s*-{2,}",
+        "[delimitador eliminado]",
+        text,
+        flags=re.I,
+    )
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
 
 
@@ -124,10 +123,16 @@ def _validate_and_normalize(data: Any) -> dict[str, Any]:
     if missing:
         raise ValueError(f"Faltan llaves obligatorias: {', '.join(missing)}")
 
-    category = str(data["category"]).strip().upper()
-    priority = str(data["priority"]).strip().upper()
+    raw_category = data["category"]
+    raw_priority = data["priority"]
     response = data["response"]
     review = data["requiresHumanReview"]
+
+    if not isinstance(raw_category, str) or not isinstance(raw_priority, str):
+        raise ValueError("Los campos 'category' y 'priority' deben ser cadenas de texto.")
+
+    category = raw_category.strip().upper()
+    priority = raw_priority.strip().upper()
 
     if category not in VALID_CATEGORIES:
         raise ValueError(f"Categoría inválida: {category!r}")
@@ -152,13 +157,19 @@ def _validate_and_normalize(data: Any) -> dict[str, Any]:
 
 def _call_gemini(message: str) -> str:
     """Llama a Gemini forzando salida JSON y devuelve el texto crudo."""
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key or api_key == "tu_api_key_aqui":
-        raise RuntimeError("GEMINI_API_KEY no está configurada (revisa tu archivo .env).")
+        raise GenerativeConfigError(
+            "GEMINI_API_KEY no está configurada (revisa tu archivo .env)."
+        )
 
-    # Import diferido: el módulo se puede importar aunque la librería no esté instalada.
-    from google import genai
-    from google.genai import types
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as exc:
+        raise GenerativeConfigError(
+            "La dependencia 'google-genai' no está instalada en el entorno."
+        ) from exc
 
     client = genai.Client(
         api_key=api_key,
@@ -175,28 +186,43 @@ def _call_gemini(message: str) -> str:
         ),
     )
     if not result.text:
-        raise ValueError("Gemini devolvió una respuesta vacía (posible bloqueo de seguridad).")
+        raise GenerativeProviderError(
+            "Gemini devolvió una respuesta vacía (posible bloqueo de seguridad)."
+        )
     return result.text
 
 
 def analyze_generative(message: str) -> dict[str, Any]:
     """Analiza un ticket con Gemini y devuelve el contrato interno del sistema.
 
-    Nunca lanza excepciones: ante cualquier fallo devuelve una estructura segura
-    con `requiresHumanReview = True`.
+    Args:
+        message: Texto de la solicitud enviada por el usuario.
+
+    Returns:
+        Diccionario con las claves `category`, `priority`, `response` y
+        `requiresHumanReview`.
+
+    Raises:
+        ValueError: Si `message` no es una cadena válida o está vacío.
+        GenerativeConfigError: Si falta la configuración o dependencia de Gemini.
+        GenerativeProviderError: Si falla la llamada, red o el formato de salida.
     """
     if not isinstance(message, str) or not message.strip():
-        return _safe_fallback("Mensaje vacío o de tipo inválido.")
+        raise ValueError("El campo 'message' debe ser una cadena de texto no vacía.")
 
     try:
         raw = _call_gemini(_sanitize_ticket(message))
         return _validate_and_normalize(json.loads(raw))
+    except GenerativeEngineError:
+        raise
     except json.JSONDecodeError as exc:
-        return _safe_fallback(f"JSON inválido del modelo: {exc.msg}")
+        raise GenerativeProviderError(f"JSON inválido del modelo: {exc.msg}") from None
     except ValueError as exc:
-        return _safe_fallback(f"Respuesta fuera de contrato: {exc}")
+        raise GenerativeProviderError(f"Respuesta fuera de contrato: {exc}") from None
     except Exception as exc:  # noqa: BLE001 - errores de red/cuota/API; no exponer secretos
-        return _safe_fallback(f"Error del proveedor ({type(exc).__name__}).")
+        raise GenerativeProviderError(
+            f"Error al consultar el proveedor generativo ({type(exc).__name__})."
+        ) from None
 
 
 if __name__ == "__main__":
@@ -207,4 +233,7 @@ if __name__ == "__main__":
     ]
     for text in test_messages:
         print(f"\n>>> Ticket: {text}")
-        print(json.dumps(analyze_generative(text), ensure_ascii=False, indent=2))
+        try:
+            print(json.dumps(analyze_generative(text), ensure_ascii=False, indent=2))
+        except (GenerativeEngineError, ValueError) as err:
+            print(f"Error controlado: {err}", file=sys.stderr)
