@@ -1,0 +1,7 @@
+# Dependencias base del proyecto AI Support Engine (Fase 1)
+# El motor tradicional (src/engines/traditional.py) funciona solo con librería estándar de Python 3.10+.
+# Las dependencias web/LLM pueden instalarse cuando los integrantes 2 y 3 integren sus módulos:
+# fastapi>=0.115.0
+# uvicorn>=0.32.0
+# pydantic>=2.9.0
+# python-dotenv>=1.0.1
