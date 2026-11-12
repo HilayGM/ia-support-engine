@@ -6,19 +6,25 @@ import os
 import re
 import unicodedata
 from importlib import import_module
+from pathlib import Path
 from typing import Any, Callable
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 
+from src.engines.generative import GenerativeConfigError
 from src.engines.traditional import analyze_traditional
 from src.schemas import AnalyzeRequest, AnalyzeResponse, EngineResult, Mode
 
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+
 app = FastAPI(title="AI Support Engine", version="0.1.0")
 ENGINE_TIMEOUT_SECONDS = 30.0
+DEFAULT_GENERATIVE_CALLABLE = "src.engines.generative:analyze_generative"
 
 # Capa conservadora de revisión; no altera las predicciones de cada motor.
 # Es una heurística, no una defensa exhaustiva contra prompt injection.
@@ -44,9 +50,7 @@ class EngineUnavailable(Exception):
 def get_engine(mode: Mode) -> Callable[[str], Any]:
     if mode == "traditional":
         return analyze_traditional
-    # Los documentos no fijan el nombre de la función generativa. Se configura
-    # únicamente cuando el Integrante 2 entregue su implementación y firma real.
-    target = os.getenv("AI_SUPPORT_GENERATIVE_CALLABLE", "")
+    target = os.getenv("AI_SUPPORT_GENERATIVE_CALLABLE", DEFAULT_GENERATIVE_CALLABLE)
     module_name, separator, function_name = target.partition(":")
     if not separator or not module_name or not function_name.isidentifier():
         raise EngineUnavailable
@@ -108,6 +112,8 @@ async def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
         raw = await asyncio.wait_for(
             execute_engine(engine, payload.message), timeout=ENGINE_TIMEOUT_SECONDS
         )
+    except GenerativeConfigError:
+        raise HTTPException(503, "Motor generativo no disponible o no configurado.") from None
     except TimeoutError:
         raise HTTPException(504, "Tiempo de espera del motor agotado.") from None
     except Exception:
