@@ -193,5 +193,39 @@ class TestBenchmarkDatasetAndReporting(unittest.TestCase):
         self.assertIn("generative", report)
 
 
+class TestAnalyzeEndpointML(unittest.TestCase):
+    """Pruebas del endpoint POST /api/analyze con el motor de Machine Learning."""
+
+    def setUp(self) -> None:
+        self.client = TestClient(app, raise_server_exceptions=False)
+
+    def test_ml_security_prediction_and_contract(self) -> None:
+        res = self.client.post(
+            "/api/analyze",
+            json={
+                "message": "Alguien entró a mi cuenta sin autorización",
+                "mode": "ml",
+            },
+        )
+        self.assertEqual(res.status_code, 200)
+        body = res.json()
+        self.assertEqual(
+            set(body.keys()),
+            {"category", "priority", "response", "requiresHumanReview", "mode"},
+        )
+        self.assertEqual(body["mode"], "ml")
+        self.assertEqual(body["category"], "SECURITY")
+        self.assertTrue(body["requiresHumanReview"])
+
+    def test_ml_unavailable_returns_503(self) -> None:
+        with patch.dict(os.environ, {"AI_SUPPORT_ML_CALLABLE": ""}, clear=False):
+            res = self.client.post(
+                "/api/analyze",
+                json={"message": "No puedo iniciar sesión", "mode": "ml"},
+            )
+        self.assertEqual(res.status_code, 503)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

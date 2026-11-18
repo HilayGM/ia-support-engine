@@ -4,7 +4,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, StringConstraints, model_validator
 
-Mode = Literal["traditional", "generative"]
+Mode = Literal["traditional", "generative", "ml"]
 Category = Literal["ACCESS", "BUG", "FEATURE", "SECURITY"]
 Priority = Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
 MessageText = Annotated[

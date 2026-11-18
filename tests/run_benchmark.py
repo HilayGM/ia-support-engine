@@ -130,9 +130,12 @@ def evaluate(client: Any, case: TestCase, mode: Mode, repetition: int) -> Observ
     return observation
 
 
-def summarize(observations: list[Observation]) -> dict[str, dict[str, Any]]:
+def summarize(
+    observations: list[Observation],
+    modes: tuple[Mode, ...] = MODES,
+) -> dict[str, dict[str, Any]]:
     summary = {}
-    for mode in MODES:
+    for mode in modes:
         rows = [row for row in observations if row.mode == mode]
         total = len(rows)
         metrics: dict[str, Any] = {
@@ -146,7 +149,11 @@ def summarize(observations: list[Observation]) -> dict[str, dict[str, Any]]:
     return summary
 
 
-def markdown_report(cases: list[TestCase], observations: list[Observation]) -> str:
+def markdown_report(
+    cases: list[TestCase],
+    observations: list[Observation],
+    modes: tuple[Mode, ...] = MODES,
+) -> str:
     references = {case.id: case for case in cases}
     lines = [
         "| Caso | Repetición | Motor | Referencia cat./prior. | Obtenido cat./prior. | Revisión | Estado HTTP | Formato | Acierto cat./prior./conjunto |",
@@ -168,7 +175,7 @@ def markdown_report(cases: list[TestCase], observations: list[Observation]) -> s
         "| Motor | Evaluados | Fallos | No disponibles | Categoría | Prioridad | Conjunta | Formato válido | Revisión humana |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ])
-    for mode, metrics in summarize(observations).items():
+    for mode, metrics in summarize(observations, modes=modes).items():
         percentages = " | ".join(
             f"{metrics[key]:.2f}%" for key in
             ("category_correct", "priority_correct", "joint_correct", "valid_format", "review_correct")
@@ -205,7 +212,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=40.0, help="Timeout HTTP remoto en segundos.")
     parser.add_argument("--json", action="store_true", help="Imprime resultados y resumen completos como JSON.")
+    parser.add_argument(
+        "--modes",
+        nargs="+",
+        choices=("traditional", "generative", "ml"),
+        default=list(MODES),
+        help="Motores a evaluar (por defecto: traditional generative).",
+    )
     args = parser.parse_args(argv)
+    selected_modes: tuple[Mode, ...] = tuple(dict.fromkeys(args.modes))  # type: ignore[assignment]
     if args.repeat < 1 or not math.isfinite(args.timeout) or args.timeout <= 0:
         parser.error("--repeat debe ser >= 1 y --timeout debe ser positivo y finito.")
     if args.base_url:
@@ -223,12 +238,12 @@ def main(argv: list[str] | None = None) -> int:
     with api_client(args.base_url, args.timeout) as client:
         for repetition in range(1, args.repeat + 1):
             for case in cases:
-                for mode in MODES:
+                for mode in selected_modes:
                     observations.append(evaluate(client, case, mode, repetition))
     if args.json:
-        print(json.dumps({"results": [asdict(row) for row in observations], "summary": summarize(observations)}, ensure_ascii=False, indent=2))
+        print(json.dumps({"results": [asdict(row) for row in observations], "summary": summarize(observations, modes=selected_modes)}, ensure_ascii=False, indent=2))
     else:
-        print(markdown_report(cases, observations))
+        print(markdown_report(cases, observations, modes=selected_modes))
     # Una predicción errónea es una medición válida. Los errores operativos sí
     # producen salida 1 para hacer visibles las ejecuciones incompletas en CI.
     return int(any(not row.valid_format for row in observations))

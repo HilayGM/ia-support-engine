@@ -17,6 +17,7 @@ from pydantic import ValidationError
 from starlette.concurrency import run_in_threadpool
 
 from src.engines.generative import GenerativeConfigError
+from src.engines.ml import MLModelUnavailableError
 from src.engines.traditional import analyze_traditional
 from src.schemas import AnalyzeRequest, AnalyzeResponse, EngineResult, Mode
 
@@ -25,6 +26,11 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 app = FastAPI(title="AI Support Engine", version="0.1.0")
 ENGINE_TIMEOUT_SECONDS = 30.0
 DEFAULT_GENERATIVE_CALLABLE = "src.engines.generative:analyze_generative"
+DEFAULT_ML_CALLABLE = "src.engines.ml:analyze_ml"
+ENGINE_CALLABLE_ENV: dict[str, tuple[str, str]] = {
+    "generative": ("AI_SUPPORT_GENERATIVE_CALLABLE", DEFAULT_GENERATIVE_CALLABLE),
+    "ml": ("AI_SUPPORT_ML_CALLABLE", DEFAULT_ML_CALLABLE),
+}
 
 # Capa conservadora de revisión; no altera las predicciones de cada motor.
 # Es una heurística, no una defensa exhaustiva contra prompt injection.
@@ -50,7 +56,8 @@ class EngineUnavailable(Exception):
 def get_engine(mode: Mode) -> Callable[[str], Any]:
     if mode == "traditional":
         return analyze_traditional
-    target = os.getenv("AI_SUPPORT_GENERATIVE_CALLABLE", DEFAULT_GENERATIVE_CALLABLE)
+    env_var, default_target = ENGINE_CALLABLE_ENV[mode]
+    target = os.getenv(env_var, default_target)
     module_name, separator, function_name = target.partition(":")
     if not separator or not module_name or not function_name.isidentifier():
         raise EngineUnavailable
@@ -95,25 +102,30 @@ async def invalid_request(_request: Request, exc: RequestValidationError) -> JSO
     "/api/analyze",
     response_model=AnalyzeResponse,
     responses={
-        500: {"description": "Error del motor tradicional o de su contrato."},
+        500: {"description": "Error del motor tradicional/ML o de su contrato."},
         502: {"description": "Error del proveedor generativo o de su contrato."},
-        503: {"description": "Motor generativo no disponible o no configurado."},
+        503: {"description": "Motor solicitado no disponible o no configurado."},
         504: {"description": "Tiempo de espera del motor agotado."},
     },
 )
 async def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
+    unavailable_detail = (
+        "Motor generativo no disponible o no configurado."
+        if payload.mode == "generative"
+        else "Motor de Machine Learning no disponible o no configurado."
+    )
     try:
         engine = get_engine(payload.mode)
     except EngineUnavailable:
-        raise HTTPException(503, "Motor generativo no disponible o no configurado.") from None
+        raise HTTPException(503, unavailable_detail) from None
 
     error_status = 502 if payload.mode == "generative" else 500
     try:
         raw = await asyncio.wait_for(
             execute_engine(engine, payload.message), timeout=ENGINE_TIMEOUT_SECONDS
         )
-    except GenerativeConfigError:
-        raise HTTPException(503, "Motor generativo no disponible o no configurado.") from None
+    except (GenerativeConfigError, MLModelUnavailableError):
+        raise HTTPException(503, unavailable_detail) from None
     except TimeoutError:
         raise HTTPException(504, "Tiempo de espera del motor agotado.") from None
     except Exception:
