@@ -1,6 +1,6 @@
 # AI Support Engine
 
-Prototipo funcional que clasifica solicitudes de soporte técnico (`ACCESS`, `BUG`, `FEATURE`, `SECURITY`), asigna prioridad (`LOW`, `MEDIUM`, `HIGH`, `CRITICAL`), genera una respuesta acorde y determina si requiere revisión humana (`requiresHumanReview`). Compara un **motor tradicional basado en reglas simbólicas** frente a un **motor generativo real con Google Gemini** detrás de un contrato único en `POST /api/analyze`.
+Prototipo funcional que clasifica solicitudes de soporte técnico (`ACCESS`, `BUG`, `FEATURE`, `SECURITY`), asigna prioridad (`LOW`, `MEDIUM`, `HIGH`, `CRITICAL`), genera una respuesta acorde y determina si requiere revisión humana (`requiresHumanReview`). Compara un **motor tradicional basado en reglas simbólicas**, un **motor generativo real con Google Gemini** y un **motor independiente de Machine Learning supervisado** (`TF-IDF + LogisticRegression`) detrás de un contrato único en `POST /api/analyze`.
 
 ## Integrantes del equipo y contribuciones
 
@@ -15,24 +15,30 @@ Prototipo funcional que clasifica solicitudes de soporte técnico (`ACCESS`, `BU
 ## Arquitectura del proyecto
 
 ```text
+data/
+  tickets.csv              Dataset balanceado de 200 tickets para entrenar/nutrir el modelo ML
+models/
+  support_ml_model.joblib  Pipeline serializado (TF-IDF palabras+caracteres + Regresión Logística)
 src/
   engines/
-    traditional.py       Motor simbólico determinista (sin modelos generativos)
-    generative.py        Motor generativo real con Google Gemini (google-genai)
-  schemas.py             Contratos estrictos Pydantic 2 (entrada, motor y salida)
-  app.py                 Servidor FastAPI y endpoint POST /api/analyze
+    traditional.py         Motor simbólico determinista (sin modelos generativos)
+    generative.py          Motor generativo real con Google Gemini (google-genai)
+    ml.py                  Motor independiente de Machine Learning (entrenamiento, caché e inferencia)
+  schemas.py               Contratos estrictos Pydantic 2 (entrada, motor y salida)
+  app.py                   Servidor FastAPI y endpoint POST /api/analyze
 tests/
-  test_traditional.py    19 pruebas unitarias del motor tradicional
-  test_generative.py     10 pruebas unitarias del motor generativo (sanitización, contrato y errores)
-  test_api.py            12 pruebas de integración de la API, códigos HTTP y benchmark
-  test_cases.json        Dataset comparativo (4 normales, 4 ambiguos, 2 prompt injection)
-  run_benchmark.py       Benchmark automatizado contra la API real
-.env.example             Plantilla de variables de entorno (sin credenciales)
-requirements.txt         Dependencias del proyecto
-context.md / fases.md    Contratos compartidos y plan de ejecución en fases
+  test_traditional.py      19 pruebas unitarias del motor tradicional
+  test_generative.py       10 pruebas unitarias del motor generativo (sanitización, contrato y errores)
+  test_ml.py               9 pruebas unitarias del dataset (200 filas), entrenamiento y motor ML
+  test_api.py              14 pruebas de integración de la API, códigos HTTP y benchmark
+  test_cases.json          Dataset comparativo (4 normales, 4 ambiguos, 2 prompt injection)
+  run_benchmark.py         Benchmark automatizado contra la API real
+.env.example               Plantilla de variables de entorno (sin credenciales)
+requirements.txt           Dependencias del proyecto (incluye pandas, scikit-learn y joblib)
+context.md / fases.md      Contratos compartidos y plan de ejecución en fases
 ```
 
-La API expone `POST /api/analyze` aceptando `mode: "traditional"` o `mode: "generative"` (por defecto apunta a `src.engines.generative:analyze_generative`, configurable vía `AI_SUPPORT_GENERATIVE_CALLABLE`). Ambos motores cumplen el mismo contrato de salida de cinco campos y nunca hacen respaldo silencioso entre sí ante fallos.
+La API expone `POST /api/analyze` aceptando `mode: "traditional"`, `"generative"` o `"ml"` (con caché en memoria y carga perezosa). Todos los motores cumplen el mismo contrato de salida de cinco campos y nunca hacen respaldo silencioso entre sí ante fallos.
 
 ---
 
@@ -110,27 +116,41 @@ curl -X POST http://127.0.0.1:8000/api/analyze \
   -d '{"message":"No puedo iniciar sesión","mode":"traditional"}'
 ```
 
-### Ejecutar suite de pruebas unitarias y de integración (41 pruebas)
+### Ejecutar suite de pruebas unitarias y de integración (52 pruebas)
 
 ```bash
 python -B -m unittest discover -s tests -p "test_*.py" -v
 ```
 
+### Entrenar, nutrir y probar el motor de Machine Learning (`data/tickets.csv`)
+
+El modelo se entrena una sola vez con `data/tickets.csv` (200 registros balanceados: 50 por categoría), evalúa un split 80/20 estratificado e imprime el `classification_report`, y persiste el pipeline en `models/support_ml_model.joblib` para inferencia instantánea:
+
+```bash
+# Entrenar / reentrenar y probar predicción:
+python -B -m src.engines.ml --train
+
+# Predecir un ticket específico con confianza probabilística:
+python -B -m src.engines.ml --predict "Alguien entró a mi cuenta sin autorización"
+```
+
+Para nutrirlo con nuevos tickets desde Python sin duplicados: `feed_dataset([{"message": "...", "category": "SECURITY", "priority": "HIGH"}])`.
+
 ### Ejecutar benchmark comparativo (≥10 casos)
 
 ```bash
 # En proceso (sin servidor externo):
-python -B -m tests.run_benchmark
+python -B -m tests.run_benchmark --modes traditional ml
 
-# O contra un servidor Uvicorn en ejecución:
-python -B -m tests.run_benchmark --base-url http://127.0.0.1:8000 --timeout 40
+# O contra un servidor Uvicorn en ejecución (incluyendo generativo si .env está configurado):
+python -B -m tests.run_benchmark --base-url http://127.0.0.1:8000 --modes traditional generative ml --timeout 40
 ```
 
 ---
 
 ## Validaciones y seguridad
 
-- **Validación de entrada (`422`):** `message` obligatorio entre 1 y 10 000 caracteres útiles; `mode` restringido estrictamente a `"traditional"` o `"generative"`; campos extra prohibidos (`extra="forbid"`, `strict=True`). Las respuestas de error no reflejan el contenido del ticket.
+- **Validación de entrada (`422`):** `message` obligatorio entre 1 y 10 000 caracteres útiles; `mode` restringido estrictamente a `"traditional"`, `"generative"` o `"ml"`; campos extra prohibidos (`extra="forbid"`, `strict=True`). Las respuestas de error no reflejan el contenido del ticket.
 - **Manejo de errores del motor/proveedor:**
   - `503`: motor generativo no configurado o `GEMINI_API_KEY` ausente/placeholder (`GenerativeConfigError` / `EngineUnavailable`).
   - `502`: fallo de red, cuota, respuesta vacía o JSON fuera de contrato del proveedor LLM (`GenerativeProviderError`).
@@ -165,15 +185,17 @@ Dataset en `tests/test_cases.json` (**10 casos**: 4 normales `N01–N04`, 4 ambi
 | Motor | Evaluados | Fallos | No disponibles | Categoría | Prioridad | Conjunta | Formato válido | Revisión humana |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `traditional` | 10 | 0 | 0 | 100.00% | 100.00% | 100.00% | 100.00% | 80.00% |
+| `ml` | 10 | 0 | 0 | 80.00% | 90.00% | 70.00% | 100.00% | 70.00% |
 | `generative` | 10 | 10 | 10 | 0.00% | 0.00% | 0.00% | 0.00% | 0.00% |
 
-> **Nota sobre ejecución generativa:** Conforme a la regla del reto, no se simularon respuestas del modelo generativo. En el entorno de verificación sin `GEMINI_API_KEY`, la API respondió `HTTP 503` controlado en los 10 casos (`BENCHMARK_EXIT=1`). Para registrar las métricas en vivo de Gemini, basta configurar `GEMINI_API_KEY` en `.env` y ejecutar `python -B -m tests.run_benchmark`.
+> **Nota sobre ejecución generativa:** Conforme a la regla del reto, no se simularon respuestas del modelo generativo. En el entorno de verificación sin `GEMINI_API_KEY`, la API respondió `HTTP 503` controlado en los 10 casos. Para registrar las métricas en vivo de Gemini, basta configurar `GEMINI_API_KEY` en `.env` y ejecutar `python -B -m tests.run_benchmark --modes traditional generative ml`.
 
 ### Evidencia de verificaciones ejecutadas
 
-- `python -B -m unittest discover -s tests -p "test_*.py" -v`: **41 pruebas aprobadas** (`19` de motor tradicional, `10` de motor generativo y `12` de API/benchmark) en `0.136s`.
-- `python -B -m tests.run_benchmark`: **10/10** respuestas válidas para `traditional` (`100.00%` categoría/prioridad, `80.00%` revisión humana) y **10/10** `HTTP 503` controlados para `generative` sin API key configurada.
+- `python -B -m src.engines.ml --train`: **92.50%** de exactitud de categoría en partición 80/20 (40 muestras de prueba sobre 200 registros); predicción verificada para `"Alguien entró a mi cuenta sin autorización"` → `SECURITY / CRITICAL` (`requiresHumanReview: true`).
+- `python -B -m unittest discover -s tests -p "test_*.py" -v`: **52 pruebas aprobadas** (`19` de motor tradicional, `10` de motor generativo, `9` de Machine Learning y `14` de API/benchmark) en `3.531s`.
+- `python -B -m tests.run_benchmark --modes traditional ml`: **10/10** respuestas válidas para ambos motores locales (`traditional` `100.00%` categoría/prioridad; `ml` `80.00%` categoría y `90.00%` prioridad en casos fuera de muestra).
 
 ## Conclusión técnica
 
-En las pruebas verificadas, el motor tradicional obtuvo 100% de acierto en categoría y prioridad, 100% de formato válido y 80% en revisión humana (fallando en activar revisión manual para los casos ambiguos A02 y A03), con latencia mínima y determinismo total. Además, resistió los dos ataques de *prompt injection* gracias a las reglas defensivas y la capa de seguridad de la API. Por su parte, el motor generativo integrado con Gemini ya cuenta con validación estricta de esquema JSON, sanitización de delimitadores y manejo controlado de errores HTTP (`502/503`), pero en este entorno respondió `503` por ausencia de `GEMINI_API_KEY` en `.env`. Por ello, aunque el motor tradicional demostró mejor disponibilidad y consistencia sin dependencias externas, la comparación predictiva completa queda sujeta a ejecutar el benchmark con una clave real de Gemini.
+En las pruebas verificadas, el motor tradicional alcanzó 100% de acierto en categoría y prioridad (80% en revisión humana sobre casos ambiguos) con determinismo total. El nuevo motor de Machine Learning (`TF-IDF` palabras+caracteres y Regresión Logística sobre 200 tickets) obtuvo 92.50% de exactitud en su split 80/20 y 80% de categoría / 90% de prioridad en el benchmark fuera de muestra, demostrando capacidad de aprendizaje y generalización mediante `feed_dataset` sin reglas manuales. Por su parte, el motor generativo con Gemini cuenta con esquema JSON estricto y manejo controlado de errores (`502/503`), aunque devolvió `503` sin `GEMINI_API_KEY`. En conjunto, el motor tradicional lidera en precisión actual sobre reglas conocidas, mientras el motor ML aporta adaptabilidad continua conforme se nutre el CSV.
